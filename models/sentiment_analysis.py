@@ -134,9 +134,11 @@ class FinancialSentimentAnalyzer:
         """
         return {
             'sentiment_cache_size': len(self.sentiment_cache),
+            'batch_cache_size': getattr(self, 'batch_cache_size', 0),
             'cache_hits': self.cache_hits,
             'cache_misses': self.cache_misses,
-            'cache_hit_rate': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0
+            'cache_hit_rate': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0,
+            'batch_cache_hit_rate': getattr(self, 'batch_cache_hit_rate', 0.0)
         }
     
     def clear_cache(self):
