@@ -1,0 +1,911 @@
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import numpy as np
+from datetime import datetime, timedelta
+import akshare as ak
+
+from crawlers.stock_data import StockDataCrawler, get_stock_news as get_stock_news_akshare
+from models.sentiment_analysis import FinancialSentimentAnalyzer
+from analysis.stock_sentiment_analysis import StockSentimentAnalyzer
+
+st.set_page_config(
+    page_title="股票情绪分析与趋势洞察工具",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+@st.cache_resource
+def init_modules():
+    stock_crawler = StockDataCrawler()
+    sentiment_analyzer = FinancialSentimentAnalyzer()
+    stock_sentiment_analyzer = StockSentimentAnalyzer()
+    return stock_crawler, sentiment_analyzer, stock_sentiment_analyzer
+
+stock_crawler, sentiment_analyzer, stock_sentiment_analyzer = init_modules()
+
+@st.cache_data(ttl=600)
+def get_market_sentiment_top(top_n=5):
+    """
+    获取全市场情绪 Z-Score 最高的 N 只股票
+    :param top_n: 返回的股票数量
+    :return: 包含股票代码、名称、Z-Score、核心逻辑的DataFrame
+    """
+    try:
+        logger = logging.getLogger(__name__)
+        logger.info(f"开始扫描全市场情绪异动股票，目标数量: {top_n}")
+        
+        stock_list_df = stock_crawler.get_stock_list()
+        if stock_list_df.empty:
+            return pd.DataFrame()
+        
+        results = []
+        checked_count = 0
+        max_check = 100
+        
+        for idx, row in stock_list_df.head(max_check).iterrows():
+            stock_code = row['代码']
+            stock_name = row['名称']
+            
+            try:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=30)
+                start_date_str = start_date.strftime("%Y%m%d")
+                end_date_str = end_date.strftime("%Y%m%d")
+                
+                stock_df = stock_crawler.get_stock_price(stock_code, start_date_str, end_date_str)
+                if stock_df.empty or len(stock_df) < 10:
+                    continue
+                
+                news_df = get_stock_news_akshare(stock_code, days=30)
+                if news_df.empty:
+                    continue
+                
+                news_df = normalize_news_columns(news_df)
+                sentiment_index_series, sentiment_df = stock_sentiment_analyzer.calculate_sentiment_index(news_df)
+                
+                if sentiment_index_series.empty:
+                    continue
+                
+                extreme_df = stock_sentiment_analyzer.detect_extreme_sentiment(
+                    sentiment_index_series, 
+                    window=20, 
+                    threshold=2.0
+                )
+                
+                if extreme_df.empty:
+                    continue
+                
+                latest_extreme = extreme_df[extreme_df['extreme_signal'] != '无'].tail(1)
+                if latest_extreme.empty:
+                    continue
+                
+                z_score = latest_extreme['z_score'].iloc[0]
+                
+                if abs(z_score) < 2.0:
+                    continue
+                
+                latest_news = news_df.tail(1)
+                if not latest_news.empty:
+                    title = latest_news['title'].iloc[0]
+                    summary = latest_news['content'].iloc[0] if 'content' in latest_news.columns else ""
+                    
+                    analysis_result = sentiment_analyzer.analyze_logic_and_sentiment(title, summary)
+                    logic_summary = analysis_result.get('impact_summary', '暂无分析')
+                else:
+                    logic_summary = '暂无最新新闻'
+                
+                results.append({
+                    'code': stock_code,
+                    'name': stock_name,
+                    'z_score': z_score,
+                    'sentiment_score': sentiment_index_series.iloc[-1],
+                    'logic_summary': logic_summary
+                })
+                
+                checked_count += 1
+                if checked_count >= top_n * 2:
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"分析股票 {stock_code} 失败: {e}")
+                continue
+        
+        if not results:
+            return pd.DataFrame()
+        
+        results_df = pd.DataFrame(results)
+        results_df = results_df.sort_values('z_score', ascending=False).head(top_n)
+        
+        logger.info(f"扫描完成，找到 {len(results_df)} 只异动股票")
+        return results_df
+        
+    except Exception as e:
+        logger.error(f"获取市场情绪异动股票失败: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=1800)
+def get_ai_strategy_insight(stock_code, sentiment_score, correlation, latest_momentum):
+    """
+    获取 AI 策略洞察（核心逻辑、风险预警、T+1 建议仓位）
+    :param stock_code: 股票代码
+    :param sentiment_score: 当前情感分
+    :param correlation: 情绪-股价相关性
+    :param latest_momentum: 最新情绪动量
+    :return: 包含核心逻辑、风险预警、建议仓位的字典
+    """
+    try:
+        logger = logging.getLogger(__name__)
+        
+        fundamental_metrics = stock_sentiment_analyzer.get_fundamental_metrics(stock_code)
+        
+        core_logic_parts = []
+        risk_warnings = []
+        
+        if sentiment_score > 0.5:
+            core_logic_parts.append("当前舆情情绪积极")
+        elif sentiment_score < -0.5:
+            core_logic_parts.append("当前舆情情绪消极")
+        
+        if abs(correlation) > 0.5:
+            direction = "正相关" if correlation > 0 else "负相关"
+            core_logic_parts.append(f"舆情与股价{direction}显著")
+        elif abs(correlation) < 0.1:
+            risk_warnings.append("该股受舆情驱动极弱，需谨慎参考")
+        
+        if fundamental_metrics['is_fundamentally_healthy']:
+            core_logic_parts.append("基本面健康（ROE > 8%）")
+        else:
+            risk_warnings.append("基本面一般，需关注财务风险")
+        
+        if latest_momentum > 0.1:
+            core_logic_parts.append("情绪动量向上")
+        elif latest_momentum < -0.1:
+            risk_warnings.append("情绪动量向下，需警惕")
+        
+        core_logic = "；".join(core_logic_parts) if core_logic_parts else "暂无明显驱动逻辑"
+        risk_warning = "；".join(risk_warnings) if risk_warnings else "暂无明显风险"
+        
+        if sentiment_score > 0.6 and fundamental_metrics['is_fundamentally_healthy']:
+            position_suggestion = "建议仓位：30%-50%（情绪积极+基本面健康）"
+        elif sentiment_score > 0.3:
+            position_suggestion = "建议仓位：10%-30%（情绪偏积极）"
+        elif sentiment_score < -0.5:
+            position_suggestion = "建议仓位：0%-10%（情绪消极，建议观望）"
+        else:
+            position_suggestion = "建议仓位：10%-20%（中性偏谨慎）"
+        
+        return {
+            'core_logic': core_logic,
+            'risk_warning': risk_warning,
+            'position_suggestion': position_suggestion,
+            'fundamental_metrics': fundamental_metrics
+        }
+        
+    except Exception as e:
+        logger.error(f"获取 AI 策略洞察失败: {e}")
+        return {
+            'core_logic': "分析失败，请稍后重试",
+            'risk_warning': "无法评估风险",
+            'position_suggestion': "建议仓位：0%-10%（分析失败）",
+            'fundamental_metrics': {}
+        }
+
+def get_sentiment_color(sentiment_score, z_score=None):
+    """
+    根据情感分和 Z-Score 返回颜色（颜色深浅反映 Z-Score 强度）
+    :param sentiment_score: 情感分（-1 到 1）
+    :param z_score: Z-Score（可选，用于调整颜色深浅）
+    :return: 颜色值
+    """
+    if sentiment_score > 0:
+        base_color = [255, 0, 0]
+    else:
+        base_color = [0, 255, 0]
+    
+    if z_score is not None:
+        intensity = min(abs(z_score) / 3.0, 1.0)
+    else:
+        intensity = min(abs(sentiment_score), 1.0)
+    
+    if sentiment_score > 0:
+        r = 255
+        g = int(255 * (1 - intensity))
+        b = int(255 * (1 - intensity))
+    else:
+        r = int(255 * (1 - intensity))
+        g = 255
+        b = int(255 * (1 - intensity))
+    
+    return f'rgb({r}, {g}, {b})'
+
+st.sidebar.title("股票选择")
+
+@st.cache_data(ttl=7200)
+def load_stock_list():
+    return stock_crawler.get_stock_list()
+
+stock_list_df = load_stock_list()
+
+@st.cache_data
+def get_company_to_code_mapping():
+    if not stock_list_df.empty:
+        return {row['名称']: row['代码'] for _, row in stock_list_df.iterrows()}
+    return {}
+
+company_to_code = get_company_to_code_mapping()
+
+DEFAULT_STOCK_CODE = "600519"
+DEFAULT_COMPANY_NAME = "贵州茅台"
+
+search_method = st.sidebar.radio(
+    "搜索方式",
+    ["选择股票", "输入公司名称"]
+)
+
+selected_stock = None
+stock_code = None
+
+if search_method == "选择股票":
+    if not stock_list_df.empty:
+        stock_options = {f"{row['代码']} - {row['名称']}": row['代码'] for _, row in stock_list_df.iterrows()}
+        default_option = f"{DEFAULT_STOCK_CODE} - {DEFAULT_COMPANY_NAME}"
+        default_index = list(stock_options.keys()).index(default_option) if default_option in stock_options else 0
+        
+        selected_stock = st.sidebar.selectbox(
+            "选择股票",
+            options=list(stock_options.keys()),
+            index=default_index
+        )
+        
+        stock_code = stock_options[selected_stock]
+else:
+    company_name = st.sidebar.text_input("输入公司名称", DEFAULT_COMPANY_NAME)
+    if company_name:
+        if company_name in company_to_code:
+            stock_code = company_to_code[company_name]
+            st.sidebar.success(f"找到匹配的股票代码: {stock_code}")
+        else:
+            matched_companies = [name for name in company_to_code.keys() if company_name in name]
+            if matched_companies:
+                selected_company = st.sidebar.selectbox(
+                    "可能匹配的公司",
+                    options=matched_companies
+                )
+                stock_code = company_to_code[selected_company]
+            else:
+                st.sidebar.warning(f"未找到匹配的公司: {company_name}")
+                stock_code = st.sidebar.text_input("手动输入股票代码", DEFAULT_STOCK_CODE)
+
+st.sidebar.title("日期范围")
+start_date = st.sidebar.date_input("开始日期", value=pd.to_datetime("2024-01-01"))
+end_date = st.sidebar.date_input("结束日期", value=pd.to_datetime("today"))
+
+start_date_str = start_date.strftime("%Y%m%d")
+end_date_str = end_date.strftime("%Y%m%d")
+
+st.sidebar.title("分析参数")
+correlation_lag = st.sidebar.slider("相关性分析滞后天数", 0, 5, 1)
+divergence_window = st.sidebar.slider("背离分析窗口大小", 5, 30, 10)
+
+st.sidebar.title("填充策略")
+fill_method = st.sidebar.radio(
+    "情绪指数填充方法",
+    ["智能填充", "前向填充", "零值填充"],
+    index=0
+)
+
+# 映射显示名称到实际方法名
+fill_method_map = {
+    "智能填充": "smart",
+    "前向填充": "forward",
+    "零值填充": "zero"
+}
+
+# 只有在智能填充时显示阈值滑块
+forward_fill_threshold = 5
+if fill_method == "智能填充":
+    forward_fill_threshold = st.sidebar.slider(
+        "前向填充最大连续天数",
+        1, 15, 5
+    )
+
+st.title("📈 股票情绪分析与趋势洞察工具")
+
+@st.cache_data(ttl=600)
+def render_market_sentiment_monitor():
+    """
+    渲染顶部'全场异动监控带'：实时滚动显示情绪 Z-Score 最高的 5 只股票
+    """
+    try:
+        st.markdown("### 🔥 全场异动监控带")
+        
+        market_top_df = get_market_sentiment_top(top_n=5)
+        
+        if market_top_df.empty:
+            st.info("暂无市场异动数据，请稍后刷新")
+            return
+        
+        for idx, row in market_top_df.iterrows():
+            z_score = row['z_score']
+            sentiment_score = row['sentiment_score']
+            color = get_sentiment_color(sentiment_score, z_score)
+            
+            with st.container():
+                cols = st.columns([2, 3, 2, 5])
+                cols[0].markdown(f"**{row['name']}**")
+                cols[0].caption(f"{row['code']}")
+                
+                sentiment_emoji = "📈" if sentiment_score > 0 else "📉"
+                cols[1].metric(
+                    f"情绪分 {sentiment_emoji}",
+                    f"{sentiment_score:.3f}",
+                    delta_color="normal" if sentiment_score > 0 else "inverse"
+                )
+                
+                z_score_color = "🔴" if z_score > 0 else "🟢"
+                cols[2].metric(
+                    f"Z-Score {z_score_color}",
+                    f"{z_score:.2f}",
+                    delta_color="normal" if z_score > 0 else "inverse"
+                )
+                
+                cols[3].markdown(f"<span style='color: {color}; font-weight: bold;'>{row['logic_summary']}</span>", unsafe_allow_html=True)
+            
+            st.divider()
+        
+    except Exception as e:
+        st.error(f"渲染市场异动监控带失败: {e}")
+
+render_market_sentiment_monitor()
+
+@st.cache_data(ttl=300)
+def load_stock_data(stock_code, start_date, end_date):
+    return stock_crawler.get_stock_price(stock_code, start_date, end_date)
+
+@st.cache_data(ttl=3600)
+def load_stock_info(stock_code):
+    return stock_crawler.get_stock_info(stock_code)
+
+@st.cache_data(ttl=1800)
+def load_stock_news(stock_code, days=90):
+    """
+    优先使用AKShare官方接口获取新闻数据（稳定无反爬）
+    """
+    try:
+        df_news = get_stock_news_akshare(stock_code, days)
+        if not df_news.empty:
+            return df_news
+    except Exception as e:
+        st.warning(f"AKShare新闻接口获取失败: {e}，尝试使用备用数据源")
+    
+    try:
+        return stock_crawler.get_stock_news(stock_code, days, use_mock_data=True)
+    except Exception as e:
+        st.error(f"所有新闻数据源均获取失败: {e}")
+        return pd.DataFrame(columns=['date', 'title', 'content'])
+
+@st.cache_data
+def normalize_news_columns(df_news):
+    """
+    标准化新闻数据列名，确保包含必要的列
+    """
+    if df_news.empty:
+        return df_news
+    
+    df = df_news.copy()
+    
+    # 确保 date 列是 datetime 类型，并标准化为日期（去除时间部分）
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    
+    # 如果没有 title 列，使用 content 的前50字符作为 title
+    if 'title' not in df.columns and 'content' in df.columns:
+        df['title'] = df['content'].apply(lambda x: str(x)[:50] + "..." if len(str(x)) > 50 else str(x))
+    elif 'title' not in df.columns:
+        df['title'] = "股吧帖子"
+    
+    # 确保 content 列存在
+    if 'content' not in df.columns:
+        df['content'] = ""
+    
+    # 确保有 view_count 列
+    if 'view_count' not in df.columns:
+        if 'reading' in df.columns:
+            df['view_count'] = df['reading']
+        else:
+            df['view_count'] = 1
+    
+    # 确保有 comment_count 列
+    if 'comment_count' not in df.columns:
+        if 'comments' in df.columns:
+            df['comment_count'] = df['comments']
+        else:
+            df['comment_count'] = 1
+    
+    return df
+
+@st.cache_data
+def calculate_daily_sentiment(news_df):
+    sentiment_index_series, sentiment_df = stock_sentiment_analyzer.calculate_sentiment_index(news_df)
+    return sentiment_index_series, sentiment_df
+
+@st.cache_data
+def fill_missing_sentiment(sentiment_df, trading_dates, fill_method='smart', forward_fill_threshold=5):
+    """
+    填充缺失日期的情绪指数值，确保每天都有情绪值
+    :param sentiment_df: 情绪数据DataFrame，包含 date 和 sentiment_index 列
+    :param trading_dates: 完整的交易日列表
+    :param fill_method: 填充方法，'forward'（前向填充）、'zero'（填充为0）或 'smart'（智能填充）
+    :param forward_fill_threshold: 智能填充时，前向填充的最大连续天数阈值
+    :return: 填充后的情绪数据DataFrame
+    """
+    if sentiment_df.empty:
+        return sentiment_df
+    
+    df = sentiment_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 使用完整的交易日列表创建DataFrame
+    full_df = pd.DataFrame({'date': trading_dates})
+    
+    merged_df = pd.merge(full_df, df, on='date', how='left')
+    
+    if fill_method == 'smart':
+        # 智能填充：连续缺失天数小于阈值时使用前向填充，超过阈值时使用0填充
+        # 计算连续缺失天数
+        merged_df['is_missing'] = merged_df['sentiment_index'].isna()
+        merged_df['group_id'] = (merged_df['is_missing'] != merged_df['is_missing'].shift()).cumsum()
+        
+        # 对每个缺失值组进行处理
+        def smart_fill_group(group):
+            if not group['is_missing'].any():
+                return group
+            
+            # 计算当前组的连续缺失天数
+            consecutive_missing_days = len(group)
+            
+            if consecutive_missing_days <= forward_fill_threshold:
+                # 连续缺失天数小于等于阈值，使用前向填充
+                group['sentiment_index'] = group['sentiment_index'].fillna(method='ffill')
+                if 'sentiment_momentum' in group.columns:
+                    group['sentiment_momentum'] = group['sentiment_momentum'].fillna(method='ffill')
+            else:
+                # 连续缺失天数超过阈值，使用0填充
+                group['sentiment_index'] = group['sentiment_index'].fillna(0)
+                if 'sentiment_momentum' in group.columns:
+                    group['sentiment_momentum'] = group['sentiment_momentum'].fillna(0)
+            
+            return group
+        
+        # 应用智能填充
+        merged_df = merged_df.groupby('group_id').apply(smart_fill_group)
+        
+        # 处理可能的初始缺失值（前向填充无法处理的情况）
+        merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(0)
+        if 'sentiment_momentum' in merged_df.columns:
+            merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].fillna(0)
+            
+        # 清理辅助列
+        merged_df = merged_df.drop(['is_missing', 'group_id'], axis=1)
+        
+    elif fill_method == 'forward':
+        # 传统前向填充
+        merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(method='ffill').fillna(0)
+        if 'sentiment_momentum' in merged_df.columns:
+            merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].fillna(method='ffill').fillna(0)
+    else:
+        # 填充为0
+        merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(0)
+        if 'sentiment_momentum' in merged_df.columns:
+            merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].fillna(0)
+    
+    return merged_df
+
+@st.cache_data
+def detect_divergence(df_price, sentiment_index_series, divergence_window):
+    return stock_sentiment_analyzer.detect_divergence(df_price, sentiment_index_series, divergence_window)
+
+@st.cache_data
+def calculate_sentiment_correlation(combined_df):
+    if len(combined_df) > 1:
+        correlation = combined_df['close'].corr(combined_df['sentiment_index'])
+        return correlation
+    return 0
+
+if stock_code:
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=90)
+        start_date_str = start_date.strftime("%Y%m%d")
+        end_date_str = end_date.strftime("%Y%m%d")
+        
+        stock_df = load_stock_data(stock_code, start_date_str, end_date_str)
+        stock_info = load_stock_info(stock_code)
+        
+        if stock_info:
+            st.subheader("股票基本信息")
+            info_cols = st.columns(4)
+            info_cols[0].metric("股票代码", stock_info.get("股票代码", stock_code))
+            info_cols[1].metric("股票名称", stock_info.get("股票名称", "未知"))
+            info_cols[2].metric("行业", stock_info.get("行业", "未知"))
+            info_cols[3].metric("地区", stock_info.get("地区", "未知"))
+        
+        # 显示缓存统计信息（可折叠）
+        with st.expander("📊 缓存性能统计"):
+            cache_stats = sentiment_analyzer.get_cache_stats()
+            cache_cols = st.columns(4)
+            cache_cols[0].metric("情感缓存大小", cache_stats['sentiment_cache_size'])
+            cache_cols[1].metric("批量缓存大小", cache_stats['batch_cache_size'])
+            cache_cols[2].metric("缓存命中率", f"{cache_stats['cache_hit_rate']:.2%}")
+            cache_cols[3].metric("批量缓存命中率", f"{cache_stats['batch_cache_hit_rate']:.2%}")
+            
+            if st.button("清空缓存"):
+                sentiment_analyzer.clear_cache()
+                st.success("缓存已清空！")
+                st.rerun()
+        
+        if not stock_df.empty:
+            st.subheader("股价走势与舆情分析")
+            
+            news_df = load_stock_news(stock_code, days=90)
+            
+            if not news_df.empty:
+                st.info("📰 数据来源：东方财富官方新闻 (AKShare 接口，稳定无反爬)")
+                # 标准化新闻数据列名
+                news_df = normalize_news_columns(news_df)
+                
+                sentiment_index_series, sentiment_df = calculate_daily_sentiment(news_df)
+                
+                # 填充缺失日期的情绪指数值
+                if not sentiment_df.empty:
+                    # 从股票数据中获取完整的交易日列表
+                    df_price = stock_df.copy()
+                    df_price = df_price.rename(columns={
+                        '日期': 'date',
+                        '开盘': 'open',
+                        '收盘价': 'close',
+                        '最高': 'high',
+                        '最低': 'low',
+                        '成交量': 'volume'
+                    })
+                    df_price['date'] = pd.to_datetime(df_price['date']).dt.normalize()
+                    trading_dates = df_price['date'].tolist()
+                    
+                    sentiment_df_filled = fill_missing_sentiment(
+                        sentiment_df, 
+                        trading_dates, 
+                        fill_method=fill_method_map[fill_method],
+                        forward_fill_threshold=forward_fill_threshold
+                    )
+                    sentiment_index_series_filled = sentiment_df_filled.set_index('date')['sentiment_index']
+                    st.info(f"📊 情绪数据：原始 {len(sentiment_df)} 天，填充后 {len(sentiment_df_filled)} 天")
+                    st.info(f"🔧 填充策略：{fill_method}" + (f" (阈值：{forward_fill_threshold}天)" if fill_method == "智能填充" else ""))
+                    st.info("情绪指数已连续填充（无新闻日继承前值），真实新闻日用深色标记")
+                else:
+                    # 如果情绪数据为空，使用0值填充所有交易日
+                    df_price = stock_df.copy()
+                    df_price = df_price.rename(columns={
+                        '日期': 'date',
+                        '开盘': 'open',
+                        '收盘价': 'close',
+                        '最高': 'high',
+                        '最低': 'low',
+                        '成交量': 'volume'
+                    })
+                    df_price['date'] = pd.to_datetime(df_price['date']).dt.normalize()
+                    trading_dates = df_price['date'].tolist()
+                    
+                    sentiment_df_filled = pd.DataFrame({
+                        'date': trading_dates,
+                        'sentiment_index': [0] * len(trading_dates),
+                        'sentiment_momentum': [0] * len(trading_dates)
+                    })
+                    sentiment_index_series_filled = sentiment_df_filled.set_index('date')['sentiment_index']
+                    st.info(f"📊 情绪数据：原始 0 天，填充后 {len(sentiment_df_filled)} 天")
+                    st.info(f"🔧 填充策略：{fill_method}" + (f" (阈值：{forward_fill_threshold}天)" if fill_method == "智能填充" else ""))
+                    st.info("情绪指数已连续填充（无新闻日继承前值），真实新闻日用深色标记")
+                
+                df_price = stock_df.copy()
+                df_price = df_price.rename(columns={
+                    '日期': 'date',
+                    '开盘': 'open',
+                    '收盘价': 'close',
+                    '最高': 'high',
+                    '最低': 'low',
+                    '成交量': 'volume'
+                })
+                df_price['date'] = pd.to_datetime(df_price['date']).dt.normalize()
+                
+                df_price['pct_change'] = df_price['close'].pct_change() * 100
+                
+                if df_price.empty or sentiment_index_series_filled.empty:
+                    st.error("股价或情绪数据为空，请检查网络或日期范围")
+                    st.stop()
+                
+                combined_df = detect_divergence(df_price, sentiment_index_series_filled, divergence_window)
+                
+                if not sentiment_df_filled.empty:
+                    latest_sentiment = sentiment_df_filled['sentiment_index'].iloc[-1] if len(sentiment_df_filled) > 0 else 0
+                    latest_momentum = sentiment_df_filled['sentiment_momentum'].iloc[-1] if len(sentiment_df_filled) > 1 else 0
+                    
+                    correlation = calculate_sentiment_correlation(combined_df)
+            
+            if 'combined_df' in locals() and not combined_df.empty:
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                
+                required_columns = ['date', 'open', 'high', 'low', 'close', 'sentiment_index']
+                missing_columns = [col for col in required_columns if col not in combined_df.columns]
+                
+                if missing_columns:
+                    st.error(f"缺少必要的列: {missing_columns}")
+                    st.write("可用列名：", combined_df.columns.tolist())
+                else:
+                    fig.add_trace(
+                        go.Candlestick(
+                            x=combined_df['date'],
+                            open=combined_df['open'],
+                            high=combined_df['high'],
+                            low=combined_df['low'],
+                            close=combined_df['close'],
+                            name='K线图'
+                        ),
+                        secondary_y=False,
+                    )
+                    
+                    # 区分真实新闻日和填充日
+                    # 创建一个辅助列来标记真实新闻日
+                    df_with_indicator = combined_df.merge(
+                        sentiment_df[['date', 'sentiment_index']].rename(columns={'sentiment_index': 'real_sentiment'}),
+                        on='date',
+                        how='left'
+                    )
+                    df_with_indicator['is_real_news'] = ~df_with_indicator['real_sentiment'].isna()
+                    
+                    # 计算 Z-Score 用于颜色深浅
+                    sentiment_mean = df_with_indicator['sentiment_index'].mean()
+                    sentiment_std = df_with_indicator['sentiment_index'].std()
+                    df_with_indicator['z_score'] = (df_with_indicator['sentiment_index'] - sentiment_mean) / sentiment_std
+                    
+                    # 为每个数据点计算颜色（基于情感分和 Z-Score）
+                    df_with_indicator['color'] = df_with_indicator.apply(
+                        lambda row: get_sentiment_color(row['sentiment_index'], row['z_score']),
+                        axis=1
+                    )
+                    
+                    # 分离真实新闻日和填充日的数据
+                    real_news_data = df_with_indicator[df_with_indicator['is_real_news']]
+                    filled_data = df_with_indicator[~df_with_indicator['is_real_news']]
+                    
+                    # 先绘制填充日的数据（作为背景）
+                    if not filled_data.empty:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=filled_data['date'],
+                                y=filled_data['sentiment_index'],
+                                name='填充的情绪指数',
+                                line=dict(color='lightgray', width=1, dash='dash'),
+                                opacity=0.3
+                            ),
+                            secondary_y=True,
+                        )
+                    
+                    # 再绘制真实新闻日的数据（使用动态颜色）
+                    if not real_news_data.empty:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=real_news_data['date'],
+                                y=real_news_data['sentiment_index'],
+                                name='真实的情绪指数',
+                                mode='lines+markers',
+                                line=dict(color='gray', width=1),
+                                marker=dict(
+                                    color=real_news_data['color'],
+                                    size=6,
+                                    line=dict(color='white', width=1)
+                                ),
+                                opacity=0.9,
+                                customdata=real_news_data[['z_score', 'sentiment_index']],
+                                hovertemplate='<b>日期</b>: %{x}<br>' +
+                                              '<b>情绪分</b>: %{customdata[1]:.3f}<br>' +
+                                              '<b>Z-Score</b>: %{customdata[0]:.2f}<extra></extra>'
+                            ),
+                            secondary_y=True,
+                        )
+                    # 如果没有真实新闻日数据，绘制所有数据
+                    elif df_with_indicator.shape[0] > 0:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_with_indicator['date'],
+                                y=df_with_indicator['sentiment_index'],
+                                name='情绪指数（全部填充）',
+                                line=dict(color='lightgray', width=1, dash='dash'),
+                                opacity=0.5
+                            ),
+                            secondary_y=True,
+                        )
+                
+                    if 'signal' in combined_df.columns:
+                        top_divergence = combined_df[combined_df['signal'] == '潜在卖出']
+                        if not top_divergence.empty:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=top_divergence['date'],
+                                    y=top_divergence['high'],
+                                    mode='markers',
+                                    name='潜在卖出',
+                                    marker=dict(color='purple', size=12, symbol='triangle-up')
+                                ),
+                                secondary_y=False,
+                            )
+                        
+                        bottom_divergence = combined_df[combined_df['signal'] == '潜在买入']
+                        if not bottom_divergence.empty:
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=bottom_divergence['date'],
+                                    y=bottom_divergence['low'],
+                                    mode='markers',
+                                    name='潜在买入',
+                                    marker=dict(color='orange', size=12, symbol='triangle-down')
+                                ),
+                                secondary_y=False,
+                            )
+                    
+                    fig.update_layout(
+                        title=f'{stock_info.get("股票名称", stock_code)} 股价走势与情绪分析',
+                        hovermode='x unified',
+                        xaxis_rangeslider_visible=False,
+                        height=600
+                    )
+                    
+                    fig.update_yaxes(title_text='股价 (元)', secondary_y=False)
+                    fig.update_yaxes(title_text='情绪指数 (-1 到 1)', secondary_y=True)
+                    
+                    st.plotly_chart(fig, width='stretch')
+                    
+                    st.subheader("🤖 AI 策略洞察")
+                    
+                    if 'latest_sentiment' in locals() and 'correlation' in locals() and 'latest_momentum' in locals():
+                        ai_insight = get_ai_strategy_insight(
+                            stock_code, 
+                            latest_sentiment, 
+                            correlation, 
+                            latest_momentum
+                        )
+                        
+                        insight_cols = st.columns(3)
+                        
+                        with insight_cols[0]:
+                            st.markdown("### 💡 核心逻辑")
+                            st.info(ai_insight['core_logic'])
+                        
+                        with insight_cols[1]:
+                            st.markdown("### ⚠️ 风险预警")
+                            st.warning(ai_insight['risk_warning'])
+                        
+                        with insight_cols[2]:
+                            st.markdown("### 📊 T+1 建议仓位")
+                            st.success(ai_insight['position_suggestion'])
+                        
+                        st.divider()
+                        
+                        if ai_insight['fundamental_metrics']:
+                            st.markdown("### 📈 基本面指标")
+                            fund_cols = st.columns(3)
+                            fund_cols[0].metric("ROE", f"{ai_insight['fundamental_metrics']['roe']:.2f}%")
+                            fund_cols[1].metric("毛利率", f"{ai_insight['fundamental_metrics']['gross_margin']:.2f}%")
+                            fund_cols[2].metric("负债率", f"{ai_insight['fundamental_metrics']['debt_ratio']:.2f}%")
+                    else:
+                        st.info("正在计算 AI 策略洞察...")
+                    
+                    st.subheader("分析结果摘要")
+                    
+                    st.markdown("### 情绪-股价相关性分析")
+                    corr_cols = st.columns(3)
+                    corr_cols[0].metric("相关系数", f"{correlation:.3f}" if 'correlation' in locals() else "N/A")
+                    corr_cols[1].metric("最新情绪指数", f"{latest_sentiment:.3f}" if 'latest_sentiment' in locals() else "N/A")
+                    corr_cols[2].metric("情绪动量", f"{latest_momentum:.3f}" if 'latest_momentum' in locals() else "N/A")
+                    
+                    if 'correlation' in locals():
+                        if correlation > 0.5:
+                            st.success("情绪与股价呈现强正相关，情绪变化可能引领股价走势")
+                        elif correlation < -0.5:
+                            st.success("情绪与股价呈现强负相关，情绪变化可能与股价反向变动")
+                        else:
+                            st.info("情绪与股价相关性较弱，建议结合其他指标分析")
+                    
+                    st.markdown("### 背离信号分析")
+                    signal_cols = st.columns(2)
+                    
+                    if 'signal' in combined_df.columns:
+                        sell_signals = len(combined_df[combined_df['signal'].str.contains('卖出|顶背离', na=False)])
+                        buy_signals = len(combined_df[combined_df['signal'].str.contains('买入|底背离', na=False)])
+                        
+                        signal_cols[0].metric("潜在卖出信号", sell_signals)
+                        signal_cols[1].metric("潜在买入信号", buy_signals)
+                        
+                        if 'signal' in combined_df.columns and not combined_df[combined_df['signal'].notna()].empty:
+                            latest_signal = combined_df[combined_df['signal'].notna()].iloc[-1]
+                            st.write(f"最新背离信号：{latest_signal['signal']} （日期：{latest_signal['date']}）")
+                            st.dataframe(
+                                combined_df[['date', 'close', 'sentiment_index', 'signal']].dropna(subset=['signal']),
+                                width=1000,
+                                hide_index=True
+                            )
+                        else:
+                            st.write("暂无检测到背离信号")
+                    else:
+                        signal_cols[0].metric("潜在卖出信号", 0)
+                        signal_cols[1].metric("潜在买入信号", 0)
+            
+            st.subheader("详细数据")
+            
+            display_df = combined_df.copy()
+            
+            if 'date' in display_df.columns:
+                display_df['日期'] = display_df['date']
+            if 'open' in display_df.columns:
+                display_df['开盘'] = display_df['open']
+            if 'close' in display_df.columns:
+                display_df['收盘价'] = display_df['close']
+            if 'high' in display_df.columns:
+                display_df['最高'] = display_df['high']
+            if 'low' in display_df.columns:
+                display_df['最低'] = display_df['low']
+            if 'volume' in display_df.columns:
+                display_df['成交量'] = display_df['volume']
+            if 'sentiment_index' in display_df.columns:
+                display_df['情绪指数'] = display_df['sentiment_index']
+            if 'signal' in display_df.columns:
+                display_df['背离信号'] = display_df['signal']
+            
+            display_columns = []
+            for col in ['日期', '开盘', '收盘价', '最高', '最低', '成交量', '情绪指数', '背离信号']:
+                if col in display_df.columns:
+                    display_columns.append(col)
+            
+            st.dataframe(
+                display_df[display_columns], 
+                width='stretch'
+            )
+            
+            st.subheader("舆情得分分布")
+            
+            if 'sentiment_index' in combined_df.columns:
+                fig_dist = px.histogram(
+                    combined_df, 
+                    x='sentiment_index', 
+                    nbins=30, 
+                    marginal="box",
+                    title="情绪指数分布"
+                )
+                fig_dist.update_layout(height=400)
+                st.plotly_chart(fig_dist, width='stretch')
+            else:
+                st.warning("情绪指数列不存在，无法显示分布图")
+            
+            st.subheader("数据导出")
+            csv_data = combined_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="下载数据为CSV",
+                data=csv_data,
+                file_name=f"{stock_code}_analysis_{start_date_str}_{end_date_str}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("无法获取股票数据，请检查股票代码和日期范围")
+    except Exception as e:
+        st.error(f"发生错误: {str(e)}")
+        st.exception(e)
+
+st.markdown("---")
+st.markdown("📊 股票情绪分析与趋势洞察工具 | 数据来源：AkShare | 舆情分析：FinBERT | 新闻源：东方财富官方 (AKShare 接口)")
+st.markdown("⚠️ 注意：本工具仅供学习研究使用，不构成任何投资建议")
