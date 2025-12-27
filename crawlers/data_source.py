@@ -356,14 +356,12 @@ class AkShareDataSource(DataSource):
             df = df.rename(columns={
                 '发布时间': 'date',
                 '新闻标题': 'title',
-                '新闻内容': 'content'
+                '新闻内容': 'content',
+                '文章来源': 'source'
             })
             
             # 转换日期格式
             df['date'] = pd.to_datetime(df['date'])
-            
-            # 添加来源
-            df['source'] = 'AkShare'
             
             # 按日期排序
             df = df.sort_values('date', ascending=False)
@@ -421,9 +419,7 @@ class AkShareDataSource(DataSource):
             # 转换股票代码格式
             code = stock_code.split('.')[0]
             
-            df = self.ak.stock_financial_indicator_ths(
-                symbol=f"{code}.sh" if code.startswith('6') else f"{code}.sz"
-            )
+            df = self.ak.stock_financial_abstract_new_ths(symbol=code)
             
             if df.empty:
                 logger.warning(f"未获取到 {stock_code} 的财务指标")
@@ -433,24 +429,31 @@ class AkShareDataSource(DataSource):
                     'debt_ratio': 0.0
                 }
             
-            latest = df.iloc[0]
+            # 获取最新一期的数据
+            latest_report = df['report_date'].max()
+            latest_df = df[df['report_date'] == latest_report]
             
             roe = 0.0
             gross_margin = 0.0
             debt_ratio = 0.0
             
-            if 'ROE(%)' in latest:
-                roe = float(latest['ROE(%)']) if pd.notna(latest['ROE(%)']) else 0.0
-            elif '净资产收益率' in latest:
-                roe = float(latest['净资产收益率']) if pd.notna(latest['净资产收益率']) else 0.0
+            # 提取 ROE
+            roe_row = latest_df[latest_df['metric_name'] == 'index_weighted_avg_roe']
+            if not roe_row.empty:
+                roe_value = roe_row['value'].iloc[0]
+                roe = float(roe_value) if pd.notna(roe_value) else 0.0
             
-            if '销售毛利率' in latest:
-                gross_margin = float(latest['销售毛利率']) if pd.notna(latest['销售毛利率']) else 0.0
-            elif '毛利率' in latest:
-                gross_margin = float(latest['毛利率']) if pd.notna(latest['毛利率']) else 0.0
+            # 提取毛利率
+            gross_margin_row = latest_df[latest_df['metric_name'] == 'sale_gross_margin']
+            if not gross_margin_row.empty:
+                gross_margin_value = gross_margin_row['value'].iloc[0]
+                gross_margin = float(gross_margin_value) if pd.notna(gross_margin_value) else 0.0
             
-            if '资产负债率' in latest:
-                debt_ratio = float(latest['资产负债率']) if pd.notna(latest['资产负债率']) else 0.0
+            # 提取资产负债率
+            debt_ratio_row = latest_df[latest_df['metric_name'] == 'assets_debt_ratio']
+            if not debt_ratio_row.empty:
+                debt_ratio_value = debt_ratio_row['value'].iloc[0]
+                debt_ratio = float(debt_ratio_value) if pd.notna(debt_ratio_value) else 0.0
             
             logger.info(f"成功获取 {stock_code} 财务指标: ROE={roe:.2f}%, 毛利率={gross_margin:.2f}%, 负债率={debt_ratio:.2f}%")
             

@@ -82,6 +82,40 @@ class StockSentimentAnalyzer:
             logger.error(f"计算相关系数失败: {e}")
             return 0.0, 1.0
     
+    def _normalize_news_columns(self, df_news: pd.DataFrame) -> pd.DataFrame:
+        """
+        标准化新闻数据的列名（处理中英文列名）
+        :param df_news: 新闻DataFrame
+        :return: 标准化后的DataFrame
+        """
+        df = df_news.copy()
+        
+        # 处理日期列（可能是 'date' 或 '发布时间'）
+        if '发布时间' in df.columns:
+            df['date'] = pd.to_datetime(df['发布时间'])
+        elif 'date' not in df.columns:
+            raise ValueError("新闻数据缺少日期列")
+        
+        # 处理标题列（可能是 '新闻标题' 或 'title'）
+        if '新闻标题' in df.columns:
+            df['title'] = df['新闻标题']
+        elif 'title' not in df.columns:
+            raise ValueError("新闻数据缺少标题列")
+        
+        # 处理内容列（可能是 '新闻内容' 或 'content'）
+        if '新闻内容' in df.columns:
+            df['content'] = df['新闻内容']
+        elif 'content' not in df.columns:
+            df['content'] = df['title']
+        
+        # 确保 reading/comments 或 view_count/comment_count 列存在
+        if 'reading' not in df.columns and 'view_count' not in df.columns:
+            df['reading'] = 1
+        if 'comments' not in df.columns and 'comment_count' not in df.columns:
+            df['comments'] = 1
+        
+        return df
+    
     def calculate_sentiment_index(self, df_news: pd.DataFrame) -> Tuple[Series, pd.DataFrame]:
         """
         计算每日情绪指数
@@ -90,6 +124,9 @@ class StockSentimentAnalyzer:
         """
         try:
             logger.info("计算每日情绪指数")
+            
+            # 标准化列名（处理中英文列名）
+            df_news = self._normalize_news_columns(df_news)
             
             # 初始化情感分析器
             sentiment_analyzer = FinancialSentimentAnalyzer()
@@ -102,8 +139,7 @@ class StockSentimentAnalyzer:
             sentiment_scores = sentiment_analyzer.batch_analyze_sentiment(df_news['full_text'].tolist())
             df_news['sentiment_score'] = sentiment_scores
             
-            # 确保日期列是datetime类型
-            df_news['date'] = pd.to_datetime(df_news['date'])
+            # 日期列已经在 _normalize_news_columns 中转换为 datetime 类型
             
             # 计算权重
             if 'reading' in df_news.columns and 'comments' in df_news.columns:
