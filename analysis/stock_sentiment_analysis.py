@@ -115,7 +115,8 @@ class StockSentimentAnalyzer:
             
             # 按日期分组计算加权平均情绪指数
             sentiment_index = df_news.groupby('date').apply(
-                lambda x: (x['sentiment_score'] * x['weight']).sum() / x['weight'].sum()
+                lambda x: (x['sentiment_score'] * x['weight']).sum() / x['weight'].sum(),
+                include_groups=False
             )
             
             # 按日期排序
@@ -275,37 +276,112 @@ class StockSentimentAnalyzer:
         try:
             logger.info(f"获取股票 {stock_code} 的基本面指标")
             
-            stock_code_with_suffix = stock_code if '.' in stock_code else f"{stock_code}.SH" if stock_code.startswith('6') else f"{stock_code}.SZ"
+            # 方案1：尝试从 stock_individual_info_em 获取基本信息
+            try:
+                df_info = ak.stock_individual_info_em(symbol=stock_code)
+                if not df_info.empty:
+                    info_dict = dict(zip(df_info['item'], df_info['value']))
+                    logger.info(f"从 stock_individual_info_em 获取到 {len(info_dict)} 个基本信息项")
+            except Exception as e:
+                logger.warning(f"stock_individual_info_em 获取失败: {e}")
+                info_dict = {}
             
-            df = ak.stock_financial_analysis_indicator(stock=stock_code_with_suffix)
+            # 方案2：尝试从 stock_financial_indicator_ths 获取财务指标
+            roe = 0.0
+            gross_margin = 0.0
+            debt_ratio = 0.0
             
-            if df.empty:
-                logger.warning(f"未获取到股票 {stock_code} 的基本面数据")
-                return {
-                    'roe': 0.0,
-                    'gross_margin': 0.0,
-                    'debt_ratio': 0.0,
-                    'is_fundamentally_healthy': False
-                }
+            try:
+                df_indicator = ak.stock_financial_indicator_ths(symbol=f"{stock_code}.sh" if stock_code.startswith('6') else f"{stock_code}.sz")
+                if df_indicator is not None and not df_indicator.empty:
+                    logger.info(f"从 stock_financial_indicator_ths 获取到 {len(df_indicator)} 条财务指标数据")
+                    latest_indicator = df_indicator.iloc[0]
+                    
+                    # 尝试获取 ROE
+                    if 'ROE(%)' in latest_indicator:
+                        roe = float(latest_indicator['ROE(%)']) if pd.notna(latest_indicator['ROE(%)']) else 0.0
+                        logger.info(f"从财务指标获取 ROE: {roe:.2f}%")
+                    elif '净资产收益率' in latest_indicator:
+                        roe = float(latest_indicator['净资产收益率']) if pd.notna(latest_indicator['净资产收益率']) else 0.0
+                        logger.info(f"从财务指标获取 ROE: {roe:.2f}%")
+                    
+                    # 尝试获取毛利率
+                    if '销售毛利率' in latest_indicator:
+                        gross_margin = float(latest_indicator['销售毛利率']) if pd.notna(latest_indicator['销售毛利率']) else 0.0
+                        logger.info(f"从财务指标获取毛利率: {gross_margin:.2f}%")
+                    elif '毛利率' in latest_indicator:
+                        gross_margin = float(latest_indicator['毛利率']) if pd.notna(latest_indicator['毛利率']) else 0.0
+                        logger.info(f"从财务指标获取毛利率: {gross_margin:.2f}%")
+                    
+                    # 尝试获取负债率
+                    if '资产负债率' in latest_indicator:
+                        debt_ratio = float(latest_indicator['资产负债率']) if pd.notna(latest_indicator['资产负债率']) else 0.0
+                        logger.info(f"从财务指标获取负债率: {debt_ratio:.2f}%")
+                else:
+                    logger.warning(f"财务指标数据为空或返回None")
+            except Exception as e:
+                logger.warning(f"从财务指标获取数据失败: {e}")
             
-            latest_data = df.iloc[0]
+            # 方案3：如果方案2失败，尝试从利润表和资产负债表获取
+            if roe == 0.0 or gross_margin == 0.0 or debt_ratio == 0.0:
+                try:
+                    df_profit = ak.stock_profit_sheet_by_report_em(symbol=stock_code)
+                    if df_profit is not None and not df_profit.empty:
+                        latest_profit = df_profit.iloc[0]
+                        
+                        # 计算 ROE = 净利润 / 股东权益
+                        if roe == 0.0 and '净利润' in latest_profit and '股东权益合计' in latest_profit:
+                            net_income = float(latest_profit['净利润']) if pd.notna(latest_profit['净利润']) else 0
+                            equity = float(latest_profit['股东权益合计']) if pd.notna(latest_profit['股东权益合计']) else 0
+                            if equity != 0:
+                                roe = (net_income / equity) * 100
+                                logger.info(f"从利润表计算 ROE: {roe:.2f}%")
+                        
+                        # 计算毛利率 = (营业收入 - 营业成本) / 营业收入
+                        if gross_margin == 0.0 and '营业收入' in latest_profit and '营业成本' in latest_profit:
+                            revenue = float(latest_profit['营业收入']) if pd.notna(latest_profit['营业收入']) else 0
+                            cost = float(latest_profit['营业成本']) if pd.notna(latest_profit['营业成本']) else 0
+                            if revenue != 0:
+                                gross_margin = ((revenue - cost) / revenue) * 100
+                                logger.info(f"从利润表计算毛利率: {gross_margin:.2f}%")
+                    else:
+                        logger.warning(f"利润表数据为空或返回None")
+                except Exception as e:
+                    logger.warning(f"从利润表获取数据失败: {e}")
+                
+                try:
+                    df_balance = ak.stock_balance_sheet_by_report_em(symbol=stock_code)
+                    if df_balance is not None and not df_balance.empty:
+                        latest_balance = df_balance.iloc[0]
+                        
+                        # 计算负债率 = 总负债 / 总资产
+                        if debt_ratio == 0.0 and '负债合计' in latest_balance and '资产总计' in latest_balance:
+                            total_liability = float(latest_balance['负债合计']) if pd.notna(latest_balance['负债合计']) else 0
+                            total_assets = float(latest_balance['资产总计']) if pd.notna(latest_balance['资产总计']) else 0
+                            if total_assets != 0:
+                                debt_ratio = (total_liability / total_assets) * 100
+                                logger.info(f"从资产负债表计算负债率: {debt_ratio:.2f}%")
+                    else:
+                        logger.warning(f"资产负债表数据为空或返回None")
+                except Exception as e:
+                    logger.warning(f"从资产负债表获取数据失败: {e}")
             
-            roe = latest_data.get('净资产收益率(ROE)', 0)
-            gross_margin = latest_data.get('销售毛利率', 0)
-            debt_ratio = latest_data.get('资产负债率', 0)
+            # 判断基本面是否健康（ROE > 8% 且 毛利率 > 20% 且 负债率 < 70%）
+            is_fundamentally_healthy = (roe > 8.0) and (gross_margin > 20.0) and (debt_ratio < 70.0)
             
-            is_fundamentally_healthy = roe > 8
-            
-            logger.info(f"股票 {stock_code} 基本面指标: ROE={roe:.2f}%, 毛利率={gross_margin:.2f}%, 负债率={debt_ratio:.2f}%")
+            logger.info(f"基本面指标汇总: ROE={roe:.2f}%, 毛利率={gross_margin:.2f}%, 负债率={debt_ratio:.2f}%, 健康状态={is_fundamentally_healthy}")
             
             return {
-                'roe': float(roe),
-                'gross_margin': float(gross_margin),
-                'debt_ratio': float(debt_ratio),
+                'roe': roe,
+                'gross_margin': gross_margin,
+                'debt_ratio': debt_ratio,
                 'is_fundamentally_healthy': is_fundamentally_healthy
             }
+                
         except Exception as e:
             logger.error(f"获取股票 {stock_code} 基本面指标失败: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 'roe': 0.0,
                 'gross_margin': 0.0,

@@ -83,6 +83,73 @@ class StockDataCrawler:
                 return self.stock_info_cache[stock_code]['data']
             return {}
     
+    def get_stock_basic_info(self, stock_code):
+        """
+        获取股票基本信息（名称、行业等）
+        :param stock_code: 股票代码，如 "600519"
+        :return: DataFrame包含股票基本信息
+        """
+        try:
+            logger.info(f"获取股票 {stock_code} 基本信息")
+            
+            stock_info = self._with_retry(ak.stock_individual_info_em, symbol=stock_code)
+            
+            if stock_info.empty:
+                logger.warning(f"stock_individual_info_em 返回空数据，尝试备用方案")
+                return self._get_stock_info_fallback(stock_code)
+            
+            info_dict = dict(zip(stock_info['item'], stock_info['value']))
+            
+            stock_name = info_dict.get('股票名称')
+            industry = info_dict.get('行业')
+            
+            if not stock_name:
+                logger.warning(f"无法从info_dict获取股票名称，尝试备用方案")
+                return self._get_stock_info_fallback(stock_code)
+            
+            result_df = pd.DataFrame({
+                'name': [stock_name],
+                'industry': [industry] if industry else ['未知']
+            })
+            
+            logger.info(f"成功获取股票 {stock_code} 基本信息: 名称={stock_name}, 行业={industry}")
+            return result_df
+            
+        except Exception as e:
+            logger.error(f"获取股票 {stock_code} 基本信息失败: {e}")
+            return self._get_stock_info_fallback(stock_code)
+    
+    def _get_stock_info_fallback(self, stock_code):
+        """
+        备用方案：通过ak.stock_info_a_code_name获取股票名称
+        :param stock_code: 股票代码
+        :return: DataFrame包含股票基本信息
+        """
+        try:
+            logger.info(f"使用备用方案获取股票 {stock_code} 名称")
+            stock_list = self._with_retry(ak.stock_info_a_code_name)
+            
+            if stock_list.empty:
+                logger.warning(f"stock_info_a_code_name 返回空数据")
+                return pd.DataFrame()
+            
+            stock_name = stock_list[stock_list['code'] == stock_code]['name'].values
+            
+            if len(stock_name) > 0:
+                result_df = pd.DataFrame({
+                    'name': [stock_name[0]],
+                    'industry': ['未知']
+                })
+                logger.info(f"备用方案成功获取股票 {stock_code} 名称: {stock_name[0]}")
+                return result_df
+            else:
+                logger.warning(f"在stock_info_a_code_name中未找到股票 {stock_code}")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"备用方案获取股票 {stock_code} 信息失败: {e}")
+            return pd.DataFrame()
+
     def get_stock_price(self, stock_code, start_date=None, end_date=None):
         """
         获取股票历史行情数据
@@ -149,6 +216,16 @@ class StockDataCrawler:
             logger.error(f"获取股票 {stock_code} 价格数据失败: {e}")
             return pd.DataFrame()
     
+    def get_stock_daily_data(self, stock_code, start_date=None, end_date=None):
+        """
+        获取股票每日行情数据（get_stock_price的别名，保持向后兼容）
+        :param stock_code: 股票代码，如 "600519"
+        :param start_date: 开始日期，格式 "YYYYMMDD"
+        :param end_date: 结束日期，格式 "YYYYMMDD"
+        :return: 股票行情数据DataFrame
+        """
+        return self.get_stock_price(stock_code, start_date, end_date)
+
     def get_stock_list(self, refresh=False):
         """
         获取A股股票列表
@@ -297,6 +374,21 @@ def get_stock_news(symbol, days=90):
             except Exception as e:
                 logger.warning(f"stock_comment_em 获取失败: {e}")
         
+        # 3. 如果新闻和评论数据都不足，尝试获取公告数据作为补充
+        total_news = sum(len(df) for df in all_news)
+        if total_news < 10:
+            logger.info(f"新闻和评论数据仍不足（{total_news}条），尝试获取公告数据补充")
+            try:
+                df_notice = ak.stock_notice_report_em(symbol=symbol)
+                if not df_notice.empty:
+                    df_notice = df_notice[['发布时间', '公告标题', '公告内容']].copy()
+                    df_notice.rename(columns={'发布时间': 'date', '公告标题': 'title', '公告内容': 'content'}, inplace=True)
+                    df_notice['source'] = 'stock_notice_report_em'
+                    all_news.append(df_notice)
+                    logger.info(f"stock_notice_report_em 获取 {len(df_notice)} 条公告")
+            except Exception as e:
+                logger.warning(f"stock_notice_report_em 获取失败: {e}")
+        
         if not all_news:
             logger.warning(f"所有接口均未获取到股票 {symbol} 的新闻或评论数据")
             return pd.DataFrame(columns=['date', 'title', 'content'])
@@ -340,3 +432,176 @@ def get_stock_list(refresh=False):
 def get_stock_info(stock_code):
     """获取股票基本信息（包装函数）"""
     return stock_crawler.get_stock_info(stock_code)
+
+def _normalize_stock_code(stock_code):
+    """
+    标准化股票代码，自动添加交易所后缀
+    :param stock_code: 股票代码，如 "600519"
+    :return: 标准化后的股票代码，如 "600519.SH"
+    """
+    if '.' in stock_code:
+        return stock_code
+    
+    if stock_code.startswith('6'):
+        return f"{stock_code}.SH"
+    elif stock_code.startswith('0') or stock_code.startswith('3'):
+        return f"{stock_code}.SZ"
+    else:
+        return stock_code
+
+def fetch_comprehensive_data(code):
+    """
+    健壮的数据引擎：获取股票的全面数据（基本面+行情+舆情）
+    :param code: 股票代码，如 "600519"
+    :return: 包含所有数据的字典 {
+        'basic_info': 基本面信息DataFrame,
+        'price_data': 价格数据DataFrame,
+        'news_data': 舆情数据DataFrame,
+        'success': 是否成功获取数据
+    }
+    """
+    result = {
+        'basic_info': pd.DataFrame(),
+        'price_data': pd.DataFrame(),
+        'news_data': pd.DataFrame(),
+        'success': False
+    }
+    
+    try:
+        logger.info(f"========== 开始获取股票 {code} 的全面数据 ==========")
+        
+        # 1. 获取基本面数据（强制转换为字典，确保 name 和 industry 永远有值）
+        try:
+            logger.info(f"1. 获取股票 {code} 的基本面数据")
+            normalized_code = _normalize_stock_code(code)
+            
+            df_info = ak.stock_individual_info_em(symbol=normalized_code)
+            
+            if df_info.empty:
+                logger.warning(f"stock_individual_info_em 返回空数据")
+                # 使用备用方案
+                stock_list = ak.stock_info_a_code_name()
+                if not stock_list.empty:
+                    match = stock_list[stock_list['code'] == code]
+                    if not match.empty:
+                        stock_name = match.iloc[0]['name']
+                        result['basic_info'] = pd.DataFrame({
+                            'name': [str(stock_name)],
+                            'industry': ['未知']
+                        })
+                        logger.info(f"备用方案获取基本面: 名称={stock_name}")
+                    else:
+                        # 备用方案也失败，使用默认值
+                        result['basic_info'] = pd.DataFrame({
+                            'name': [str(f'股票{code}')],
+                            'industry': ['未知']
+                        })
+                        logger.warning(f"备用方案也失败，使用默认值")
+                else:
+                    # stock_list 为空，使用默认值
+                    result['basic_info'] = pd.DataFrame({
+                        'name': [str(f'股票{code}')],
+                        'industry': ['未知']
+                    })
+                    logger.warning(f"stock_list 为空，使用默认值")
+            else:
+                info_dict = dict(zip(df_info['item'], df_info['value']))
+                stock_name = info_dict.get('股票名称', '未知')
+                industry = info_dict.get('行业', '未知')
+                
+                result['basic_info'] = pd.DataFrame({
+                    'name': [str(stock_name)],
+                    'industry': [str(industry)]
+                })
+                logger.info(f"成功获取基本面: 名称={stock_name}, 行业={industry}")
+                
+        except Exception as e:
+            logger.error(f"获取基本面数据失败: {e}")
+            result['basic_info'] = pd.DataFrame({
+                'name': [str(f'股票{code}')],
+                'industry': ['未知']
+            })
+        
+        # 2. 获取价格数据
+        try:
+            logger.info(f"2. 获取股票 {code} 的价格数据")
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
+            
+            df_price = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq"
+            )
+            
+            if not df_price.empty:
+                df_price['date'] = pd.to_datetime(df_price['日期'])
+                result['price_data'] = df_price
+                logger.info(f"成功获取 {len(df_price)} 条价格数据")
+            else:
+                logger.warning(f"价格数据为空")
+                
+        except Exception as e:
+            logger.error(f"获取价格数据失败: {e}")
+        
+        # 3. 舆情数据（瀑布流）
+        try:
+            logger.info(f"3. 获取股票 {code} 的舆情数据（瀑布流）")
+            all_news = []
+            
+            # 3.1 先尝试 stock_news_em
+            try:
+                df_news = ak.stock_news_em(symbol=code)
+                if not df_news.empty:
+                    df_news = df_news[['发布时间', '新闻标题', '新闻内容']].copy()
+                    df_news.rename(columns={'发布时间': 'date', '新闻标题': 'title', '新闻内容': 'content'}, inplace=True)
+                    df_news['source'] = 'stock_news_em'
+                    all_news.append(df_news)
+                    logger.info(f"stock_news_em 获取 {len(df_news)} 条新闻")
+            except Exception as e:
+                logger.warning(f"stock_news_em 获取失败: {e}")
+            
+            # 3.2 若为空，自动尝试 stock_notice_report_em
+            if not all_news:
+                try:
+                    df_notice = ak.stock_notice_report_em(symbol=code)
+                    if not df_notice.empty:
+                        df_notice = df_notice[['发布时间', '公告标题', '公告内容']].copy()
+                        df_notice.rename(columns={'发布时间': 'date', '公告标题': 'title', '公告内容': 'content'}, inplace=True)
+                        df_notice['source'] = 'stock_notice_report_em'
+                        all_news.append(df_notice)
+                        logger.info(f"stock_notice_report_em 获取 {len(df_notice)} 条公告")
+                except Exception as e:
+                    logger.warning(f"stock_notice_report_em 获取失败: {e}")
+            
+            # 3.3 合并舆情数据
+            if all_news:
+                df_news = pd.concat(all_news, ignore_index=True)
+                df_news['date'] = pd.to_datetime(df_news['date'], errors='coerce')
+                df_news = df_news.dropna(subset=['date'])
+                df_news = df_news.drop_duplicates(subset=['date', 'title'], keep='first')
+                result['news_data'] = df_news
+                logger.info(f"舆情数据总计: {len(df_news)} 条")
+            else:
+                logger.warning(f"所有舆情接口均未获取到数据")
+                
+        except Exception as e:
+            logger.error(f"获取舆情数据失败: {e}")
+        
+        # 判断是否成功
+        result['success'] = (
+            not result['basic_info'].empty or 
+            not result['price_data'].empty or 
+            not result['news_data'].empty
+        )
+        
+        logger.info(f"========== 股票 {code} 数据获取完成 ==========")
+        return result
+        
+    except Exception as e:
+        logger.error(f"fetch_comprehensive_data 整体失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return result

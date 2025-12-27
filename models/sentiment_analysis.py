@@ -489,6 +489,58 @@ class FinancialSentimentAnalyzer:
             results.append(score)
         return results
     
+    def batch_analyze_sentiment(self, texts: List[str]) -> List[float]:
+        """
+        批量分析文本的金融情感（analyze_batch的别名，保持向后兼容）
+        :param texts: 要分析的文本列表
+        :return: 情感得分列表
+        """
+        return self.analyze_batch(texts)
+    
+    def analyze_batch_news(self, news_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        批量分析新闻数据的情感
+        :param news_df: 新闻数据DataFrame，应包含 date, title, content 列
+        :return: 包含情绪分析结果的DataFrame，包含 date, sentiment_index 等列
+        """
+        if news_df.empty:
+            logger.warning("新闻数据为空，无法进行批量情绪分析")
+            return pd.DataFrame(columns=['date', 'sentiment_index'])
+        
+        results = []
+        
+        for idx, row in news_df.iterrows():
+            try:
+                date = row.get('date', pd.NaT)
+                title = row.get('title', '')
+                content = row.get('content', '')
+                
+                if pd.isna(date):
+                    continue
+                
+                text = f"{title} {content}" if content else title
+                
+                sentiment_score = self.analyze_sentiment(text)
+                
+                results.append({
+                    'date': date,
+                    'sentiment_index': sentiment_score
+                })
+                
+            except Exception as e:
+                logger.warning(f"分析第 {idx} 条新闻时出错: {e}")
+                continue
+        
+        if results:
+            result_df = pd.DataFrame(results)
+            result_df['date'] = pd.to_datetime(result_df['date'])
+            result_df = result_df.sort_values('date')
+            logger.info(f"批量情绪分析完成，共分析 {len(result_df)} 条新闻")
+            return result_df
+        else:
+            logger.warning("批量情绪分析未生成任何结果")
+            return pd.DataFrame(columns=['date', 'sentiment_index'])
+
     def generate_news_data(self, dates, stock_code=None):
         """
         获取真实的新闻数据和情感得分

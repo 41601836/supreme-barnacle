@@ -32,6 +32,136 @@ def init_modules():
 
 stock_crawler, sentiment_analyzer, stock_sentiment_analyzer = init_modules()
 
+# ========== 模块二：Alpha 筛选雷达 ==========
+
+# 目标池：覆盖主要行业龙头
+WATCHLIST = [
+    "600519",  # 贵州茅台
+    "300750",  # 宁德时代
+    "002594",  # 比亚迪
+    "601318",  # 中国平安
+    "000858",  # 五粮液
+    "601888",  # 中国中车
+    "000333"   # 美的集团
+]
+
+@st.cache_data(ttl=300)
+def run_alpha_screener():
+    """
+    Alpha 筛选雷达：扫描 WATCHLIST 中的股票，计算 Z-Score
+    目标：10秒内完成扫描，不调用 DeepSeek
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"========== 开始 Alpha 筛选雷达扫描 ==========")
+    
+    results = []
+    
+    for code in WATCHLIST:
+        try:
+            logger.info(f"扫描股票: {code}")
+            
+            # 获取股票数据
+            from crawlers.stock_data import fetch_comprehensive_data
+            data = fetch_comprehensive_data(code)
+            
+            if not data['success']:
+                logger.warning(f"股票 {code} 数据获取失败，跳过")
+                continue
+            
+            # 检查价格数据是否充足
+            price_df = data['price_data']
+            if price_df.empty or len(price_df) < 10:
+                logger.warning(f"股票 {code} 价格数据不足，跳过")
+                continue
+            
+            # 检查新闻数据是否充足
+            news_df = data['news_data']
+            if news_df.empty:
+                logger.warning(f"股票 {code} 新闻数据为空，跳过")
+                continue
+            
+            # 计算情绪指数
+            news_df_normalized = normalize_news_columns_local(news_df)
+            sentiment_index_series, sentiment_df = stock_sentiment_analyzer.calculate_sentiment_index(news_df_normalized)
+            
+            if sentiment_index_series.empty:
+                logger.warning(f"股票 {code} 情绪指数计算失败，跳过")
+                continue
+            
+            # 计算 Z-Score
+            sentiment_values = sentiment_index_series.values
+            if len(sentiment_values) < 5:
+                logger.warning(f"股票 {code} 情绪数据不足，跳过")
+                continue
+            
+            mean = np.mean(sentiment_values)
+            std = np.std(sentiment_values)
+            z_score = (sentiment_values[-1] - mean) / std if std > 0 else 0
+            
+            # 获取股票名称
+            basic_info = data['basic_info']
+            stock_name = basic_info['name'].iloc[0] if not basic_info.empty else f'股票{code}'
+            
+            # 获取最新新闻标题
+            latest_news = news_df_normalized.tail(1)
+            latest_title = latest_news['title'].iloc[0] if not latest_news.empty else "暂无新闻"
+            
+            results.append({
+                'code': code,
+                'name': stock_name,
+                'z_score': round(z_score, 2),
+                'sentiment_score': round(sentiment_values[-1], 3),
+                'latest_news': latest_title,
+                'price_count': len(price_df),
+                'news_count': len(news_df)
+            })
+            
+            logger.info(f"股票 {code} 扫描完成: Z-Score={z_score:.2f}")
+            
+        except Exception as e:
+            logger.error(f"扫描股票 {code} 失败: {e}")
+            continue
+    
+    # 按绝对值排序 Z-Score
+    results_df = pd.DataFrame(results)
+    if not results_df.empty:
+        results_df = results_df.sort_values('z_score', key=abs, ascending=False)
+    
+    logger.info(f"========== Alpha 筛选雷达扫描完成，共 {len(results_df)} 只股票 ==========")
+    return results_df
+
+def normalize_news_columns_local(df_news):
+    """
+    本地版本的normalize_news_columns函数
+    标准化新闻数据的列名和格式
+    """
+    if df_news.empty:
+        return df_news
+    
+    df = df_news.copy()
+    
+    # 确保 date 列是 datetime 类型，并标准化为日期（去除时间部分）
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    
+    # 如果没有 title 列，使用 content 的前50字符作为 title
+    if 'title' not in df.columns and 'content' in df.columns:
+        df['title'] = df['content'].apply(lambda x: str(x)[:50] + "..." if len(str(x)) > 50 else str(x))
+    elif 'title' not in df.columns:
+        df['title'] = "股吧帖子"
+    
+    # 确保 content 列存在
+    if 'content' not in df.columns:
+        df['content'] = df['title']
+    
+    # 确保 reading/comments 或 view_count/comment_count 列存在
+    if 'reading' not in df.columns and 'view_count' not in df.columns:
+        df['reading'] = 1
+    if 'comments' not in df.columns and 'comment_count' not in df.columns:
+        df['comments'] = 1
+        
+    return df
+
 @st.cache_data(ttl=600)
 def get_market_sentiment_top(top_n=5):
     """
@@ -69,7 +199,7 @@ def get_market_sentiment_top(top_n=5):
                 if news_df.empty:
                     continue
                 
-                news_df = normalize_news_columns(news_df)
+                news_df = normalize_news_columns_local(news_df)
                 sentiment_index_series, sentiment_df = stock_sentiment_analyzer.calculate_sentiment_index(news_df)
                 
                 if sentiment_index_series.empty:
@@ -206,15 +336,25 @@ def get_sentiment_color(sentiment_score, z_score=None):
     :param z_score: Z-Score（可选，用于调整颜色深浅）
     :return: 颜色值
     """
+    import numpy as np
+    
+    # 处理NaN值
+    if pd.isna(sentiment_score):
+        sentiment_score = 0.0
+    
     if sentiment_score > 0:
         base_color = [255, 0, 0]
     else:
         base_color = [0, 255, 0]
     
-    if z_score is not None:
+    if z_score is not None and not pd.isna(z_score):
         intensity = min(abs(z_score) / 3.0, 1.0)
     else:
         intensity = min(abs(sentiment_score), 1.0)
+    
+    # 确保intensity是有效数值
+    if pd.isna(intensity):
+        intensity = 0.5
     
     if sentiment_score > 0:
         r = 255
@@ -231,7 +371,12 @@ st.sidebar.title("股票选择")
 
 @st.cache_data(ttl=7200)
 def load_stock_list():
-    return stock_crawler.get_stock_list()
+    try:
+        return stock_crawler.get_stock_list()
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"获取股票列表失败: {e}")
+        return pd.DataFrame()
 
 stock_list_df = load_stock_list()
 
@@ -318,7 +463,474 @@ if fill_method == "智能填充":
         1, 15, 5
     )
 
+# ==================== Alpha Radar 核心功能 ====================
+
+def get_multi_source_news(stock_code, days=30):
+    """
+    多源融合数据获取：依次尝试新闻、公告、研报
+    
+    Args:
+        stock_code: 股票代码
+        days: 获取天数
+        
+    Returns:
+        DataFrame: 合并后的新闻数据
+    """
+    all_news = []
+    
+    print(f"\n📡 {stock_code}: 开始多源融合数据获取...")
+    
+    # 1. 新闻 (News): akshare.stock_news_em
+    try:
+        print(f"   📰 尝试获取新闻数据...")
+        df_news = ak.stock_news_em(symbol=stock_code)
+        if not df_news.empty:
+            df_news = df_news[['发布时间', '新闻标题', '新闻内容']].copy()
+            df_news.rename(columns={'发布时间': 'date', '新闻标题': 'title', '新闻内容': 'content'}, inplace=True)
+            df_news['source'] = 'news'
+            df_news['weight'] = 1.0  # 新闻权重
+            all_news.append(df_news)
+            print(f"   ✅ 新闻数据: {len(df_news)} 条")
+        else:
+            print(f"   ❌ 新闻数据为空")
+    except Exception as e:
+        print(f"   ❌ 新闻数据获取失败: {e}")
+    
+    # 2. 公告 (Notices): 暂时注释，akshare 公告接口可能已变更
+    # try:
+    #     print(f"   📋 尝试获取公告数据...")
+    #     df_notice = ak.stock_notice_report_em(symbol=stock_code)
+    #     if not df_notice.empty:
+    #         df_notice = df_notice[['公告日期', '公告标题', '公告内容']].copy()
+    #         df_notice.rename(columns={'公告日期': 'date', '公告标题': 'title', '公告内容': 'content'}, inplace=True)
+    #         df_notice['source'] = 'notice'
+    #         df_notice['weight'] = 1.5  # 公告权重1.5倍
+    #         all_news.append(df_notice)
+    #         print(f"   ✅ 公告数据: {len(df_notice)} 条 (权重1.5倍)")
+    #     else:
+    #         print(f"   ❌ 公告数据为空")
+    # except Exception as e:
+    #     print(f"   ❌ 公告数据获取失败: {e}")
+    
+    # 3. 研报 (Reports): 暂时注释，akshare 研报接口可能已变更
+    # try:
+    #     print(f"   📊 尝试获取研报数据...")
+    #     df_report = ak.stock_research_report_em(symbol=stock_code)
+    #     if not df_report.empty:
+    #         df_report = df_report[['发布日期', '研报标题', '研报内容']].copy()
+    #         df_report.rename(columns={'发布日期': 'date', '研报标题': 'title', '研报内容': 'content'}, inplace=True)
+    #         df_report['source'] = 'report'
+    #         df_report['weight'] = 1.0  # 研报权重
+    #         all_news.append(df_report)
+    #         print(f"   ✅ 研报数据: {len(df_report)} 条")
+    #     else:
+    #         print(f"   ❌ 研报数据为空")
+    # except Exception as e:
+    #     print(f"   ❌ 研报数据获取失败: {e}")
+    
+    # 兜底机制：只要三者之中任意一个返回了有效数据，就继续
+    if not all_news:
+        print(f"   💥 {stock_code}: 所有数据源均返回空数据")
+        return pd.DataFrame()
+    
+    # 合并数据
+    df = pd.concat(all_news, ignore_index=True)
+    print(f"   📊 {stock_code}: 多源融合完成，总计 {len(df)} 条数据")
+    
+    # 处理日期格式
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date'])
+    
+    # 去重
+    df = df.drop_duplicates(subset=['date', 'title'], keep='first')
+    
+    # 过滤日期范围
+    end_date = pd.to_datetime(datetime.now())
+    start_date = end_date - timedelta(days=days)
+    df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+    
+    print(f"   📅 {stock_code}: 日期过滤后剩余 {len(df)} 条数据")
+    
+    return df
+
+# 定义观察池：10-20只热门股票代码
+TARGET_POOL = [
+    "600519",  # 贵州茅台
+    "300750",  # 宁德时代
+    "002594",  # 比亚迪
+    "601318",  # 中国平安
+    "000858",  # 五粮液
+    "600036",  # 招商银行
+    "601012",  # 隆基绿能
+    "300059",  # 东方财富
+    "600276",  # 恒瑞医药
+    "000333",  # 美的集团
+    "601888",  # 中国中免
+    "300015",  # 爱尔眼科
+    "600887",  # 伊利股份
+    "002415",  # 海康威视
+    "600900",  # 长江电力
+]
+
+@st.cache_data(ttl=3600)  # 1小时缓存
+def scan_market_opportunities(stock_list):
+    """
+    扫描市场机会：基于黄金模型简版的自动化筛选
+    
+    Args:
+        stock_list: 股票代码列表
+        
+    Returns:
+        DataFrame: 筛选出的股票数据，按Z-Score降序排列
+    """
+    results = []
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=30)  # 放宽日期限制：30天数据
+    
+    for stock_code in stock_list:
+        try:
+            print(f"\n{'='*60}")
+            print(f"🔍 开始处理股票: {stock_code}")
+            print(f"{'='*60}")
+            
+            # 获取股票基本信息
+            stock_info = stock_crawler.get_stock_basic_info(stock_code)
+            if stock_info.empty:
+                print(f"❌ {stock_code}: 获取基本信息失败，返回空DataFrame")
+                continue
+                
+            stock_name = stock_info.iloc[0]['name'] if 'name' in stock_info.columns else stock_code
+            print(f"✅ {stock_code}: 股票名称 = {stock_name}")
+            
+            # 获取股票价格数据
+            print(f"📊 {stock_code}: 正在获取价格数据...")
+            print(f"   时间范围: {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}")
+            
+            stock_data = stock_crawler.get_stock_daily_data(stock_code, start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d'))
+            print(f"📊 {stock_code}: 行情数据行数 = {len(stock_data)}")
+            
+            if stock_data.empty:
+                print(f"❌ {stock_code}: 行情数据为空，跳过")
+                continue
+            
+            if len(stock_data) < 5:
+                print(f"❌ {stock_code}: 行情数据不足5天（当前{len(stock_data)}天），跳过")
+                continue
+            
+            # 获取新闻数据（多源融合）
+            news_data = get_multi_source_news(stock_code, days=30)
+            
+            if news_data is None or news_data.empty:
+                print(f"❌ {stock_code}: 多源融合后仍无数据")
+                continue
+            
+            # 标准化列名
+            news_data = normalize_news_columns_local(news_data)
+            print(f"📰 {stock_code}: 多源融合后新闻条数 = {len(news_data)}")
+            
+            # 容错处理：新闻数量不足（少于5条），直接跳过
+            if len(news_data) < 5:
+                print(f"❌ {stock_code}: 新闻数量不足5条（当前{len(news_data)}条），跳过")
+                continue
+            
+            # 计算情绪分析
+            print(f"🧠 {stock_code}: 正在进行情绪分析...")
+            
+            sentiment_df = sentiment_analyzer.analyze_batch_news(news_data)
+            
+            if sentiment_df.empty:
+                print(f"❌ {stock_code}: 情绪分析结果为空，跳过")
+                continue
+            
+            print(f"🧠 {stock_code}: 情绪分析行数 = {len(sentiment_df)}")
+            
+            # 如果新闻数据包含weight列，与情绪分析结果合并
+            if 'weight' in news_data.columns:
+                print(f"⚖️  {stock_code}: 应用数据源权重...")
+                # 通过索引合并weight信息
+                sentiment_df = sentiment_df.copy()
+                sentiment_df['weight'] = news_data['weight'].values[:len(sentiment_df)]
+                # 加权计算情绪指数
+                sentiment_df['weighted_sentiment'] = sentiment_df['sentiment_index'] * sentiment_df['weight']
+                sentiment_mean = sentiment_df['weighted_sentiment'].mean()
+                sentiment_std = sentiment_df['weighted_sentiment'].std()
+                print(f"📈 {stock_code}: 加权情绪统计 - 均值={sentiment_mean:.4f}, 标准差={sentiment_std:.4f}")
+            else:
+                sentiment_mean = sentiment_df['sentiment_index'].mean()
+                sentiment_std = sentiment_df['sentiment_index'].std()
+                print(f"📈 {stock_code}: 情绪统计 - 均值={sentiment_mean:.4f}, 标准差={sentiment_std:.4f}")
+            
+            # 容错处理：无法计算Z-Score（标准差为0），直接跳过
+            if sentiment_std == 0:
+                print(f"❌ {stock_code}: 情绪标准差为0，无法计算Z-Score，跳过")
+                continue
+            
+            # 获取当日情绪数据
+            today = end_date.strftime('%Y-%m-%d')
+            today_sentiment = sentiment_df[sentiment_df['date'] == today]
+            
+            print(f"📅 {stock_code}: 查找当日情绪数据（日期={today}）")
+            print(f"📅 {stock_code}: 当日情绪数据行数 = {len(today_sentiment)}")
+            
+            # 容错处理：当日无情绪数据，直接跳过
+            if today_sentiment.empty:
+                print(f"❌ {stock_code}: 当日无情绪数据，跳过")
+                continue
+            
+            # 当日情绪得分
+            today_sentiment_score = today_sentiment['sentiment_index'].mean()
+            
+            # 计算Sentiment Z-Score = (当日情绪 - 历史均值) / 历史标准差
+            today_z_score = (today_sentiment_score - sentiment_mean) / sentiment_std
+            
+            print(f"🎯 {stock_code}: 当日情绪得分 = {today_sentiment_score:.4f}")
+            print(f"🎯 {stock_code}: 当日Z-Score = {today_z_score:.4f}")
+            
+            # 获取当日股价数据
+            today_stock_data = stock_data[stock_data['date'] == today]
+            if today_stock_data.empty:
+                print(f"❌ {stock_code}: 当日无股价数据，跳过")
+                continue
+            
+            today_price_data = today_stock_data.iloc[-1]
+            current_price = today_price_data['close']
+            
+            print(f"💰 {stock_code}: 当前价格 = {current_price:.2f}")
+            
+            # 计算技术指标
+            recent_5_days = stock_data.tail(5)
+            
+            # 过去5日股价涨幅
+            price_change_5d = (recent_5_days.iloc[-1]['close'] - recent_5_days.iloc[0]['close']) / recent_5_days.iloc[0]['close'] * 100
+            
+            # 当日股价涨幅
+            yesterday_close = recent_5_days.iloc[-2]['close'] if len(recent_5_days) >= 2 else current_price
+            price_change_1d = (current_price - yesterday_close) / yesterday_close * 100
+            
+            print(f"📊 {stock_code}: 5日涨幅 = {price_change_5d:.2f}%, 当日涨幅 = {price_change_1d:.2f}%")
+            
+            # 应用黄金模型简版筛选
+            signals = []
+            
+            # 信号A：情绪突变 (Z-Score > 2.0)
+            if today_z_score > 2.0:
+                signals.append("情绪突变")
+                print(f"🔥 {stock_code}: 触发【情绪突变】信号")
+            
+            # 信号B：底部反转 (股价5日涨幅 < 0 且 情绪Z-Score > 0.5)
+            if price_change_5d < 0 and today_z_score > 0.5:
+                signals.append("底部反转")
+                print(f"📈 {stock_code}: 触发【底部反转】信号")
+            
+            # 信号C：量价共振 (情绪 > 0.8 且 股价涨幅 > 1%)
+            if today_sentiment_score > 0.8 and price_change_1d > 1.0:
+                signals.append("量价共振")
+                print(f"🤝 {stock_code}: 触发【量价共振】信号")
+            
+            # 只保留有信号的股票
+            if signals:
+                results.append({
+                    '股票代码': stock_code,
+                    '股票名称': stock_name,
+                    '当前价格': round(current_price, 2),
+                    '情绪得分': round(today_sentiment_score, 3),
+                    'Z-Score': round(today_z_score, 3),
+                    '触发信号': ', '.join(signals),
+                    '5日涨跌': round(price_change_5d, 2),
+                    '当日涨跌': round(price_change_1d, 2),
+                    '新闻数量': len(news_data)
+                })
+                print(f"✅ {stock_code}: 成功加入结果列表！触发信号: {signals}")
+            else:
+                print(f"⏭️  {stock_code}: 未触发任何信号，跳过")
+        
+        except Exception as e:
+            # 容错处理：某只股票获取失败，直接跳过，严禁让整个程序崩溃
+            print(f"💥 处理股票 {stock_code} 时发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # 转换为DataFrame并按Z-Score降序排列
+    if results:
+        result_df = pd.DataFrame(results)
+        result_df = result_df.sort_values(by='Z-Score', ascending=False)
+        return result_df
+    
+    return pd.DataFrame()
+
+def analyze_with_deepseek(stock_code: str) -> str:
+    """
+    使用 DeepSeek 分析主力意图
+    :param stock_code: 股票代码
+    :return: 主力意图分析结果
+    """
+    try:
+        from crawlers.stock_data import fetch_comprehensive_data
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"开始分析股票 {stock_code} 的主力意图")
+        
+        data = fetch_comprehensive_data(stock_code)
+        
+        if not data['success']:
+            return "数据获取失败，无法分析"
+        
+        news_df = data['news_data']
+        if news_df.empty:
+            return "暂无新闻数据，无法分析"
+        
+        latest_news = news_df.tail(10)
+        
+        analysis_results = []
+        for idx, row in latest_news.iterrows():
+            title = row.get('title', '')
+            content = row.get('content', '')
+            date = row.get('date', '')
+            
+            try:
+                result = sentiment_analyzer.analyze_logic_and_sentiment(title, content)
+                logic_category = result.get('logic_category', '消息面')
+                impact_summary = result.get('impact_summary', '暂无分析')
+                sentiment_score = result.get('sentiment_score', 0.0)
+                
+                analysis_results.append({
+                    'date': date,
+                    'title': title,
+                    'logic_category': logic_category,
+                    'impact_summary': impact_summary,
+                    'sentiment_score': sentiment_score
+                })
+            except Exception as e:
+                logger.warning(f"分析新闻失败: {e}")
+                continue
+        
+        if not analysis_results:
+            return "新闻分析失败，请稍后重试"
+        
+        df_analysis = pd.DataFrame(analysis_results)
+        
+        logic_counts = df_analysis['logic_category'].value_counts()
+        avg_sentiment = df_analysis['sentiment_score'].mean()
+        
+        main_force_intent = ""
+        if avg_sentiment > 0.3:
+            main_force_intent = "主力资金呈现净流入态势，情绪偏乐观"
+        elif avg_sentiment < -0.3:
+            main_force_intent = "主力资金呈现净流出态势，情绪偏悲观"
+        else:
+            main_force_intent = "主力资金观望为主，情绪中性"
+        
+        dominant_logic = logic_counts.index[0] if len(logic_counts) > 0 else "消息面"
+        
+        summary = f"""
+**主力意图分析报告**
+
+**核心判断：** {main_force_intent}
+
+**主要驱动逻辑：** {dominant_logic}
+
+**详细分析：**
+"""
+        
+        for idx, row in df_analysis.head(5).iterrows():
+            date_str = str(row['date'])[:10] if pd.notna(row['date']) else '未知日期'
+            summary += f"\n- **{date_str}** [{row['logic_category']}]: {row['impact_summary']}"
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"主力意图分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"分析失败: {str(e)}"
+
+def render_alpha_radar():
+    """
+    渲染Alpha雷达板块 - 基于 WATCHLIST
+    """
+    st.markdown("## 🚀 Alpha Radar - 潜力股筛选")
+    st.markdown("*基于情绪 Z-Score 的自动化机会发现引擎*")
+    
+    # 刷新按钮
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔄 刷新雷达", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+    
+    with col2:
+        st.caption(f"实时扫描 {len(WATCHLIST)} 只热门股票，基于情绪 Z-Score 筛选高潜力机会")
+    
+    # 获取数据
+    with st.spinner("正在扫描市场机会..."):
+        alpha_data = run_alpha_screener()
+    
+    if alpha_data.empty:
+        st.warning("🔍 今日暂无符合模型的股票")
+        st.info("提示：只有满足情绪 Z-Score 条件的股票才会被显示")
+        return
+    
+    # 显示发现的潜力股数量
+    st.success(f"🎯 发现 {len(alpha_data)} 只潜力股！")
+    
+    # 显示详细数据表格（单行选择模式）
+    st.subheader("📊 完整分析数据（按 Z-Score 排序）")
+    st.caption("所有发现的潜力股，已按 Z-Score 降序排列")
+    
+    # 使用 column_config 美化表格
+    column_config = {
+        'code': st.column_config.TextColumn('股票代码', width='small'),
+        'name': st.column_config.TextColumn('股票名称', width='medium'),
+        'z_score': st.column_config.NumberColumn('Z-Score', format='%.2f', width='small'),
+        'sentiment_score': st.column_config.NumberColumn('情绪得分', format='%.3f', width='small'),
+        'latest_news': st.column_config.TextColumn('最新新闻', width='large'),
+        'price_count': st.column_config.NumberColumn('价格数据量', width='small'),
+        'news_count': st.column_config.NumberColumn('新闻数据量', width='small'),
+    }
+    
+    # 选择所有列进行显示
+    all_cols = list(alpha_data.columns)
+    event = st.dataframe(
+        alpha_data[all_cols], 
+        width='stretch',
+        column_config=column_config, 
+        selection_mode="single-row",
+        on_select="rerun",
+        key="alpha_radar_table"
+    )
+    
+    # 显示统计信息
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("扫描股票池", f"{len(WATCHLIST)}只")
+    with col2:
+        st.metric("发现信号", len(alpha_data))
+    with col3:
+        st.metric("平均Z-Score", f"{alpha_data['z_score'].mean():.3f}")
+    
+    # 模块三：按需 AI 分析
+    if event and event.selection and len(event.selection['rows']) > 0:
+        selected_row_idx = event.selection['rows'][0]
+        selected_stock = alpha_data.iloc[selected_row_idx]
+        stock_code = selected_stock['code']
+        stock_name = selected_stock['name']
+        
+        st.markdown("---")
+        st.markdown(f"## 🤖 主力意图分析 - {stock_name} ({stock_code})")
+        
+        if st.button(f"🔍 分析 {stock_name} 的主力意图", key=f"analyze_{stock_code}"):
+            with st.spinner("正在调用 DeepSeek 进行深度分析..."):
+                analysis_result = analyze_with_deepseek(stock_code)
+                st.markdown(analysis_result)
+
+# ==================== 主要应用界面 ====================
 st.title("📈 股票情绪分析与趋势洞察工具")
+
+# 首先显示Alpha雷达功能
+render_alpha_radar()
+
+st.markdown("---")  # 分隔线
 
 @st.cache_data(ttl=600)
 def render_market_sentiment_monitor():
@@ -369,11 +981,21 @@ render_market_sentiment_monitor()
 
 @st.cache_data(ttl=300)
 def load_stock_data(stock_code, start_date, end_date):
-    return stock_crawler.get_stock_price(stock_code, start_date, end_date)
+    try:
+        return stock_crawler.get_stock_price(stock_code, start_date, end_date)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"获取股票价格数据失败: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def load_stock_info(stock_code):
-    return stock_crawler.get_stock_info(stock_code)
+    try:
+        return stock_crawler.get_stock_info(stock_code)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"获取股票信息失败: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
 def load_stock_news(stock_code, days=90):
@@ -475,9 +1097,9 @@ def fill_missing_sentiment(sentiment_df, trading_dates, fill_method='smart', for
             
             if consecutive_missing_days <= forward_fill_threshold:
                 # 连续缺失天数小于等于阈值，使用前向填充
-                group['sentiment_index'] = group['sentiment_index'].fillna(method='ffill')
+                group['sentiment_index'] = group['sentiment_index'].ffill()
                 if 'sentiment_momentum' in group.columns:
-                    group['sentiment_momentum'] = group['sentiment_momentum'].fillna(method='ffill')
+                    group['sentiment_momentum'] = group['sentiment_momentum'].ffill()
             else:
                 # 连续缺失天数超过阈值，使用0填充
                 group['sentiment_index'] = group['sentiment_index'].fillna(0)
@@ -487,21 +1109,24 @@ def fill_missing_sentiment(sentiment_df, trading_dates, fill_method='smart', for
             return group
         
         # 应用智能填充
-        merged_df = merged_df.groupby('group_id').apply(smart_fill_group)
+        merged_df = merged_df.groupby('group_id').apply(smart_fill_group, include_groups=False)
         
         # 处理可能的初始缺失值（前向填充无法处理的情况）
         merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(0)
         if 'sentiment_momentum' in merged_df.columns:
             merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].fillna(0)
             
-        # 清理辅助列
-        merged_df = merged_df.drop(['is_missing', 'group_id'], axis=1)
+        # 清理辅助列（只在列存在时才删除）
+        columns_to_drop = ['is_missing']
+        if 'group_id' in merged_df.columns:
+            columns_to_drop.append('group_id')
+        merged_df = merged_df.drop(columns_to_drop, axis=1)
         
     elif fill_method == 'forward':
         # 传统前向填充
-        merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(method='ffill').fillna(0)
+        merged_df['sentiment_index'] = merged_df['sentiment_index'].ffill().fillna(0)
         if 'sentiment_momentum' in merged_df.columns:
-            merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].fillna(method='ffill').fillna(0)
+            merged_df['sentiment_momentum'] = merged_df['sentiment_momentum'].ffill().fillna(0)
     else:
         # 填充为0
         merged_df['sentiment_index'] = merged_df['sentiment_index'].fillna(0)
@@ -662,13 +1287,19 @@ if stock_code:
                     )
                     
                     # 区分真实新闻日和填充日
-                    # 创建一个辅助列来标记真实新闻日
-                    df_with_indicator = combined_df.merge(
-                        sentiment_df[['date', 'sentiment_index']].rename(columns={'sentiment_index': 'real_sentiment'}),
-                        on='date',
-                        how='left'
-                    )
-                    df_with_indicator['is_real_news'] = ~df_with_indicator['real_sentiment'].isna()
+                    # 检查sentiment_df的列名并创建辅助列来标记真实新闻日
+                    if not sentiment_df.empty and 'date' in sentiment_df.columns and 'sentiment_index' in sentiment_df.columns:
+                        df_with_indicator = combined_df.merge(
+                            sentiment_df[['date', 'sentiment_index']].rename(columns={'sentiment_index': 'real_sentiment'}),
+                            on='date',
+                            how='left'
+                        )
+                        df_with_indicator['is_real_news'] = ~df_with_indicator['real_sentiment'].isna()
+                    else:
+                        # 如果sentiment_df没有正确的列，创建一个简单的标识
+                        df_with_indicator = combined_df.copy()
+                        df_with_indicator['real_sentiment'] = np.nan
+                        df_with_indicator['is_real_news'] = False
                     
                     # 计算 Z-Score 用于颜色深浅
                     sentiment_mean = df_with_indicator['sentiment_index'].mean()
@@ -837,7 +1468,7 @@ if stock_code:
                             latest_signal = combined_df[combined_df['signal'].notna()].iloc[-1]
                             st.write(f"最新背离信号：{latest_signal['signal']} （日期：{latest_signal['date']}）")
                             st.dataframe(
-                                combined_df[['date', 'close', 'sentiment_index', 'signal']].dropna(subset=['signal']),
+                                combined_df[['date', 'close', 'sentiment_index', 'signal']].dropna(subset=['signal']).fillna(''),
                                 width=1000,
                                 hide_index=True
                             )
@@ -850,6 +1481,9 @@ if stock_code:
             st.subheader("详细数据")
             
             display_df = combined_df.copy()
+            
+            # 替换NaN值为空字符串，避免显示"nan"
+            display_df = display_df.fillna('')
             
             if 'date' in display_df.columns:
                 display_df['日期'] = display_df['date']

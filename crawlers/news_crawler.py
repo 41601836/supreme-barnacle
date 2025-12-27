@@ -510,7 +510,10 @@ class NewsCrawler:
             
             soup = BeautifulSoup(response.text, "html.parser")
             
-            # 尝试多种可能的内容选择器
+            # 添加调试信息：打印页面结构
+            logger.info(f"页面标题: {soup.title.string if soup.title else '无标题'}")
+            
+            # 尝试多种可能的内容选择器（按优先级排序）
             content_selectors = [
                 'div.stockcodec',
                 'div.article-content',
@@ -518,12 +521,38 @@ class NewsCrawler:
                 'div.note-content',
                 'div[class*="content"]',
                 'div[id*="content"]',
+                'div.stockcodec_content',
+                'div.article_body',
+                'div.post_body',
+                'div.note_body',
+                'div.stockcodec-body',
+                'div.article-body',
+                'div.post-body',
+                'div.note-body',
+                'div[class*="stockcodec"]',
+                'div[class*="article"]',
+                'div[class*="post"]',
+                'div[class*="note"]',
+                'div#content',
+                'div#articleContent',
+                'div#postContent',
+                'div#noteContent',
+                'div.content',
+                'div.main-content',
+                'div.detail-content',
+                'div.text-content',
+                'div.read-content',
+                'article',
+                'section.content',
             ]
             
             content = ""
+            found_selector = None
+            
             for selector in content_selectors:
                 content_div = soup.select_one(selector)
                 if content_div:
+                    found_selector = selector
                     logger.info(f"使用选择器 '{selector}' 找到内容区域")
                     
                     # 移除无关标签
@@ -537,11 +566,45 @@ class NewsCrawler:
                     content = re.sub(r'\s+', ' ', content)
                     content = content.strip()
                     
+                    logger.info(f"提取内容长度: {len(content)} 字符")
                     break
-            else:
-                logger.warning("未找到帖子内容区域")
             
-            logger.info(f"帖子内容长度: {len(content)} 字符")
+            if not found_selector:
+                logger.warning("未找到帖子内容区域")
+                
+                # 备用方案：尝试获取所有 div 的文本
+                all_divs = soup.find_all('div')
+                logger.info(f"页面共有 {len(all_divs)} 个 div 标签")
+                
+                # 尝试找到包含最多文本的 div
+                max_text_div = None
+                max_text_length = 0
+                
+                for div in all_divs:
+                    text = div.get_text(strip=True)
+                    if len(text) > max_text_length and len(text) > 50:  # 至少50个字符
+                        max_text_div = div
+                        max_text_length = len(text)
+                
+                if max_text_div:
+                    logger.info(f"使用备用方案：找到包含最多文本的 div ({max_text_length} 字符)")
+                    
+                    # 移除无关标签
+                    for tag in max_text_div.find_all(["script", "style", "iframe", "noscript"]):
+                        tag.decompose()
+                    
+                    content = max_text_div.text.strip()
+                    
+                    # 清理多余空白
+                    import re
+                    content = re.sub(r'\s+', ' ', content)
+                    content = content.strip()
+                    
+                    logger.info(f"备用方案提取内容长度: {len(content)} 字符")
+                else:
+                    logger.warning("备用方案也无法找到有效内容")
+            
+            logger.info(f"最终帖子内容长度: {len(content)} 字符")
             
             # 添加随机延迟 5-10 秒
             delay = random.uniform(5, 10)
